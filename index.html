@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Web Scraper & Visualizer</title>
+    <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+    <script>
+        function showLoader() {
+            document.getElementById('loader').classList.remove('hidden');
+        }
+    </script>
+    <style>
+        .styled-table {
+            border-collapse: collapse;
+            margin: 1rem 0;
+            font-size: 1rem;
+            width: 100%;
+            border: 1px solid #ddd;
+        }
+        .styled-table th, .styled-table td {
+            border: 1px solid #ddd;
+            padding: 0.75rem;
+            text-align: left;
+        }
+        .styled-table thead {
+            background-color: #f3f4f6;
+            font-weight: bold;
+        }
+    </style>
+</head>
+<body class="bg-gray-100 text-gray-800">
+<div class="container mx-auto px-4 py-8">
+    <h1 class="text-3xl font-bold text-center mb-6">AI Web Scraper & Visualizer</h1>
+
+    <form method="POST" onsubmit="showLoader()" class="bg-white p-6 rounded shadow-md">
+        <div class="mb-4">
+            <label for="url" class="block text-sm font-semibold">Enter URL:</label>
+            <input type="text" id="url" name="url" value="{{ url }}" class="w-full px-4 py-2 border rounded" required>
+        </div>
+
+        {% if show_prompt %}
+        <div class="mb-4">
+            <label for="prompt" class="block text-sm font-semibold">Enter Prompt:</label>
+            <textarea id="prompt" name="prompt" class="w-full px-4 py-2 border rounded" rows="4" placeholder="e.g., Summarize the content and generate charts."></textarea>
+        </div>
+        {% endif %}
+
+        <button type="submit" class="bg-blue-600 text-white px-4 py-2 rounded hover:bg-blue-700">
+            {{ 'Analyze' if show_prompt else 'Scrape Website' }}
+        </button>
+
+        <div id="loader" class="hidden mt-4 text-center">
+            <span class="text-blue-600 font-medium">Loading, please wait...</span>
+            <div class="mt-2 animate-spin h-8 w-8 border-4 border-blue-500 border-t-transparent rounded-full mx-auto"></div>
+        </div>
+    </form>
+
+    {% if ai_response %}
+        <div class="mt-6 bg-white p-4 rounded shadow-md">
+            <h2 class="text-xl font-semibold mb-2">AI Response</h2>
+            <div class="prose prose-sm max-w-full whitespace-pre-wrap">{{ ai_response }}</div>
+        </div>
+
+        {% if tables %}
+        <div class="mt-6">
+            <h3 class="text-lg font-semibold mb-2">Extracted Tables</h3>
+            <div class="mb-4">
+                <button onclick="window.print()" class="bg-green-600 text-white px-3 py-1 rounded mr-2">Export to PDF</button>
+                <button onclick="downloadCSV()" class="bg-yellow-500 text-white px-3 py-1 rounded">Export to CSV</button>
+            </div>
+            {% for table in tables %}
+                <div class="overflow-auto mb-4">{{ table | safe }}</div>
+            {% endfor %}
+        </div>
+        {% endif %}
+
+        {% if charts %}
+        <div class="mt-6">
+            <h3 class="text-lg font-semibold mb-2">Generated Charts</h3>
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                {% for chart in charts %}
+                    <div class="bg-white rounded shadow-md p-4">
+                        <img src="/{{ chart }}" class="w-full h-auto rounded mb-2">
+                        <a href="/{{ chart }}" download class="block text-center bg-blue-500 text-white py-1 rounded">Download Image</a>
+                    </div>
+                {% endfor %}
+            </div>
+        </div>
+        {% endif %}
+    {% endif %}
+</div>
+<script>
+    function downloadCSV() {
+        let csvContent = "data:text/csv;charset=utf-8,";
+        document.querySelectorAll("table.styled-table").forEach((table, index) => {
+            const rows = Array.from(table.querySelectorAll("tr")).map(tr =>
+                Array.from(tr.querySelectorAll("th,td")).map(td => td.textContent.trim()).join(",")
+            );
+            csvContent += rows.join("\n") + "\n\n";
+        });
+        const encodedUri = encodeURI(csvContent);
+        const link = document.createElement("a");
+        link.setAttribute("href", encodedUri);
+        link.setAttribute("download", "tables_data.csv");
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+    }
+</script>
+</body>
+</html>
