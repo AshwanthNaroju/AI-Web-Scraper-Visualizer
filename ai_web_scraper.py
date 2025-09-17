@@ -1,152 +1,221 @@
-from flask import Flask, render_template, request
-from bs4 import BeautifulSoup
-import requests
-import ollama
-import re
-import matplotlib.pyplot as plt
 import os
 import uuid
-import nltk
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.decomposition import LatentDirichletAllocation
+import base64
+import markdown2
+import requests
+import matplotlib.pyplot as plt
+from bs4 import BeautifulSoup
+from flask import Flask, render_template, request, send_file
+from ollama import chat
+from collections import Counter
+from fpdf import FPDF
 import pandas as pd
-
-nltk.download('stopwords')
-from nltk.corpus import stopwords
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from webdriver_manager.chrome import ChromeDriverManager
 
 app = Flask(__name__)
-app.config['UPLOAD_FOLDER'] = 'static/charts'
-os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
-
-stop_words = set(stopwords.words('english'))
+UPLOAD_FOLDER = os.path.join(app.root_path, "static", "charts")
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 def scrape_website(url):
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36'
-    }
     try:
-        response = requests.get(url, headers=headers, timeout=10)
-        soup = BeautifulSoup(response.text, 'html.parser')
-        return soup.get_text()
+        chrome_options = Options()
+        chrome_options.add_argument("--headless")
+        chrome_options.add_argument("--disable-gpu")
+        chrome_options.add_argument("--no-sandbox")
+        driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=chrome_options)
+        driver.get(url)
+        screenshot_path = os.path.join(UPLOAD_FOLDER, f"{uuid.uuid4()}_screenshot.png")
+        driver.save_screenshot(screenshot_path)
+        content = driver.page_source
+        driver.quit()
+        soup = BeautifulSoup(content, 'html.parser')
+        return soup.get_text(separator=' ', strip=True)[:10000], screenshot_path
     except Exception as e:
-        return f"Error scraping website: {e}"
+        return f"Error scraping: {e}", None
 
-def basic_topic_modeling(text, n_topics=3):
+def extract_main_table(text):
+    headers = []
+    rows = []
+    inside_table = False
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("```"):
+            continue
+        if "|" in line and "---" not in line:
+            cells = [c.strip() for c in line.split("|") if c.strip()]
+            if not inside_table:
+                headers = cells
+                inside_table = True
+            else:
+                if len(cells) == len(headers):
+                    rows.append(cells)
+    return headers, rows
+
+def get_brand_counts_from_table(headers, table_data):
+    if not headers or not table_data:
+        return []
     try:
-        vectorizer = TfidfVectorizer(stop_words='english', max_features=1000)
-        tfidf = vectorizer.fit_transform([text])
-        lda = LatentDirichletAllocation(n_components=n_topics, random_state=42)
-        lda.fit(tfidf)
+        brand_index = headers.index("Brand")
+    except:
+        brand_index = 0
+    brands = [row[brand_index].capitalize() for row in table_data if len(row) > brand_index]
+    return Counter(brands).most_common()
 
-        topics = []
-        for topic in lda.components_:
-            words = [vectorizer.get_feature_names_out()[i] for i in topic.argsort()[:-6:-1]]
-            topics.append(words)
+def get_pie_data_from_counts(counts):
+    total = sum(count for _, count in counts)
+    if total == 0:
+        return []
+    return [(brand, round((count / total) * 100, 1)) for brand, count in counts]
 
-        return topics
-    except Exception as e:
-        return [[f"Error: {e}"]]
+def generate_chart_image(chart_data, chart_type, title):
+    if not chart_data:
+        return None, None
+    labels, values = zip(*chart_data)
+    filename = f"{uuid.uuid4()}_{chart_type.lower()}.png"
+    filepath = os.path.join(UPLOAD_FOLDER, filename)
 
-def generate_ai_response(model, content, prompt, topics):
-    topic_summary = "\n".join(["Topic {}: {}".format(i+1, ", ".join(words)) for i, words in enumerate(topics)])
-    full_prompt = f"""
-Analyze the following website content and respond to the user's prompt.
+    plt.figure(figsize=(9, 6))
+    if chart_type == "Bar":
+        bars = plt.bar(labels, values, color='skyblue')
+        plt.xticks(rotation=45, ha="right")
+        plt.xlabel("Brand")
+        plt.ylabel("Count")
+        plt.title(title)
+        for bar in bars:
+            yval = bar.get_height()
+            plt.text(bar.get_x() + bar.get_width()/2.0, yval + 0.5, int(yval), ha='center', va='bottom')
+    elif chart_type == "Pie":
+        plt.pie(values, labels=[f"{l} ({v}%)" for l, v in chart_data], autopct='%1.1f%%', startangle=140)
+        plt.axis("equal")
+        plt.title(title)
 
-Content:
-{content[:2000]}
+    plt.tight_layout()
+    plt.savefig(filepath)
+    plt.close()
 
-Identified Topics:
-{topic_summary}
+    with open(filepath, "rb") as image_file:
+        return base64.b64encode(image_file.read()).decode(), filepath
 
-Prompt: {prompt}
-
-Format your response in markdown and include:
-- A summary text
-- Markdown table using pipe format (|col1|col2| etc.)
-- BAR: Title: My Bar Chart\nLabels: A, B, C\nValues: 10, 20, 30
-- PIE: Title: My Pie Chart\nLabels: X, Y, Z\nValues: 25, 35, 40
-"""
-    try:
-        response = ollama.chat(model=model, messages=[{"role": "user", "content": full_prompt}])
-        return response['message']['content']
-    except Exception as e:
-        return f"Error from Ollama: {e}"
-
-def save_chart(fig):
-    filename = f"{app.config['UPLOAD_FOLDER']}/chart_{uuid.uuid4().hex}.png"
-    fig.tight_layout()
-    fig.savefig(filename)
-    plt.close(fig)
+def export_table_pdf(headers, table_data, filename):
+    filepath = os.path.join(UPLOAD_FOLDER, filename)
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Arial", size=10)
+    col_width = 190 / len(headers) if headers else 40
+    pdf.cell(200, 10, txt="Table Data", ln=True, align='C')
+    pdf.ln(10)
+    if headers:
+        for header in headers:
+            pdf.cell(col_width, 10, txt=header, border=1)
+        pdf.ln()
+    for row in table_data:
+        for cell in row:
+            text = str(cell)
+            pdf.cell(col_width, 10, txt=text.encode('latin-1', 'replace').decode('latin-1'), border=1)
+        pdf.ln()
+    pdf.output(filepath)
     return filename
 
-def parse_and_generate_charts(ai_response):
-    charts = []
-    tables_html = []
+def export_combined_pdf(summary_text, headers, table_data, bar_path, pie_path, screenshot_path, filename):
+    filepath = os.path.join(UPLOAD_FOLDER, filename)
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Arial", size=12)
+    pdf.cell(200, 10, txt="AI Web Scraper Report", ln=True, align='C')
+    pdf.ln(10)
+    pdf.set_font("Arial", size=10)
+    pdf.multi_cell(0, 10, summary_text)
+    pdf.ln(5)
+    if headers and table_data:
+        col_width = 190 / len(headers) if headers else 40
+        for header in headers:
+            pdf.cell(col_width, 10, txt=header, border=1)
+        pdf.ln()
+        for row in table_data:
+            for cell in row:
+                text = str(cell)
+                pdf.cell(col_width, 10, txt=text.encode('latin-1', 'replace').decode('latin-1'), border=1)
+            pdf.ln()
+    if bar_path:
+        pdf.add_page()
+        pdf.image(bar_path, x=10, y=30, w=180)
+    if pie_path:
+        pdf.add_page()
+        pdf.image(pie_path, x=10, y=30, w=180)
+    if screenshot_path:
+        pdf.add_page()
+        pdf.image(screenshot_path, x=10, y=30, w=180)
+    pdf.output(filepath)
+    return filename
 
-    markdown_tables = re.findall(r"(\|.*?\|\n(?:\|.*?\|\n)+)", ai_response)
-    for table in markdown_tables:
-        rows = [row.strip() for row in table.strip().split("\n") if row.strip()]
-        if len(rows) < 2:
-            continue
-        headers = [h.strip() for h in rows[0].split('|') if h.strip()]
-        html = '<table class="styled-table"><thead><tr>' + ''.join(f'<th>{h}</th>' for h in headers) + '</tr></thead><tbody>'
-        for row in rows[2:]:
-            cols = [c.strip() for c in row.split('|') if c.strip()]
-            html += '<tr>' + ''.join(f'<td>{c}</td>' for c in cols) + '</tr>'
-        html += '</tbody></table>'
-        tables_html.append(html)
-
-    bar_match = re.search(r"BAR:.*?Title:\s*(.*?)\s*Labels:\s*(.*?)\s*Values:\s*(.*?)($|\n)", ai_response, re.DOTALL)
-    if bar_match:
-        title = bar_match.group(1).strip()
-        labels = [x.strip() for x in bar_match.group(2).split(',')]
-        values = [int(re.findall(r'\d+', x)[0]) for x in bar_match.group(3).split(',') if re.findall(r'\d+', x)]
-        if len(labels) == len(values) and len(values) > 0:
-            fig, ax = plt.subplots(figsize=(10, 6))
-            colors = plt.cm.get_cmap('tab20c')(range(len(labels)))
-            ax.bar(labels, values, color=colors)
-            ax.set_title(title)
-            ax.set_xlabel("Categories")
-            ax.set_ylabel("Values")
-            charts.append(save_chart(fig))
-
-    pie_match = re.search(r"PIE:.*?Title:\s*(.*?)\s*Labels:\s*(.*?)\s*Values:\s*(.*?)($|\n)", ai_response, re.DOTALL)
-    if pie_match:
-        title = pie_match.group(1).strip()
-        labels = [x.strip() for x in pie_match.group(2).split(',')]
-        values = [int(re.findall(r'\d+', x)[0]) for x in pie_match.group(3).split(',') if re.findall(r'\d+', x)]
-        if len(labels) == len(values) and len(values) > 0:
-            fig, ax = plt.subplots(figsize=(8, 8))
-            ax.pie(values, labels=labels, autopct='%1.1f%%', startangle=90, colors=plt.cm.Pastel1.colors)
-            ax.set_title(title)
-            charts.append(save_chart(fig))
-
-    return tables_html, charts
-
-@app.route('/', methods=['GET', 'POST'])
+@app.route("/", methods=["GET", "POST"])
 def index():
-    content = ""
-    ai_response = ""
-    tables = []
-    charts = []
-    url = ""
-    show_prompt = False
+    result = ""
+    summary_text = ""
+    table_headers = []
+    table_data = []
+    bar_chart_img = pie_chart_img = ""
+    bar_path = pie_path = ""
+    screenshot_path = ""
+    table_pdf = bar_pdf = pie_pdf = combined_pdf = ""
 
     if request.method == "POST":
         url = request.form.get("url")
         prompt = request.form.get("prompt")
-        if url and not prompt:
-            content = scrape_website(url)
-            show_prompt = True
-        elif url and prompt:
-            content = scrape_website(url)
-            topics = basic_topic_modeling(content)
-            ai_response = generate_ai_response("mistral", content, prompt, topics)
-            if ai_response:
-                tables, charts = parse_and_generate_charts(ai_response)
+        content, screenshot_path = scrape_website(url)
 
-    return render_template('index.html', url=url, content=content, ai_response=ai_response,
-                           tables=tables, charts=charts, show_prompt=show_prompt)
+        ai_prompt = f"""You are an AI assistant that extracts structured data from web content.
 
-if __name__ == '__main__':
+TASKS:
+1. Provide a short summary.
+2. Output a markdown table with appropriate headers like Brand, Price, etc.
+3. Provide brand counts (Apple: 3, Samsung: 4) for bar chart.
+4. Provide brand-wise market share (%) for pie chart.
+
+CONTENT:
+{content}
+PROMPT:
+{prompt}
+"""
+
+        try:
+            response = chat(model="mistral", messages=[{"role": "user", "content": ai_prompt}])
+            result = response['message']['content']
+            summary_text = result.split("\n\n")[0]
+            table_headers, table_data = extract_main_table(result)
+
+            bar_data = get_brand_counts_from_table(table_headers, table_data)
+            pie_data = get_pie_data_from_counts(bar_data)
+
+            bar_chart_img, bar_path = generate_chart_image(bar_data, "Bar", "Brand Frequency")
+            pie_chart_img, pie_path = generate_chart_image(pie_data, "Pie", "Brand Market Share")
+
+            table_pdf = export_table_pdf(table_headers, table_data, f"{uuid.uuid4()}_table.pdf")
+            combined_pdf = export_combined_pdf(summary_text, table_headers, table_data, bar_path, pie_path, screenshot_path, f"{uuid.uuid4()}_report.pdf")
+
+        except Exception as e:
+            result = f"Error: {e}"
+
+    return render_template("index.html",
+                           result=result,
+                           table_headers=table_headers,
+                           table_data=table_data,
+                           bar_chart_img=bar_chart_img,
+                           pie_chart_img=pie_chart_img,
+                           table_pdf=table_pdf,
+                           bar_pdf=os.path.basename(bar_path) if bar_path else None,
+                           pie_pdf=os.path.basename(pie_path) if pie_path else None,
+                           combined_pdf=os.path.basename(combined_pdf) if combined_pdf else None)
+
+@app.route("/download/<filename>")
+def download_file(filename):
+    path = os.path.join(UPLOAD_FOLDER, filename)
+    if os.path.exists(path):
+        return send_file(path, as_attachment=True)
+    return "File not found", 404
+
+if __name__ == "__main__":
     app.run(debug=True)
